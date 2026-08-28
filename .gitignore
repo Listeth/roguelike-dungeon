@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+server.py
+main.py
+utils.py
+config.py
+db/*.py
+db/models.py
+db/storage.py
+db/init_db.py
+scripts/
+requirements.txt
+dungeon-explorer-server/
+middleware/
