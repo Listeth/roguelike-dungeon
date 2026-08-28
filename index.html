@@ -1,0 +1,1018 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>地牢冒险 - 完整版</title>
+<!-- ==========================================================
+  【使用说明】
+  ┌─────────────────────────────────────────────────────────────┐
+  │  操作方式：                                                │
+  │    - 移动：WASD 或 方向键                                  │
+  │    - 攻击：鼠标左键点击                                    │
+  │    - 打开/关闭背包：I 键                                   │
+  │    - 手动存档：S 键 或 点击 HUD 右上角“保存(S)”按钮       │
+  │                                                             │
+  │  游戏规则：                                                │
+  │    - 每层需击杀所有怪物后，楼梯出现，走上去进入下一层       │
+  │    - 每 5 层出现 1 个 Boss，击败后楼梯出现                 │
+  │    - 击杀敌人获得金币和分数，有概率掉落装备                 │
+  │    - 拾取装备自动放入背包，按 I 打开背包后点击装备可穿戴  │
+  │                                                             │
+  │  存档机制：                                                │
+  │    - 游戏自动存档（每 10 秒）                               │
+  │    - 进入新层时自动存档                                    │
+  │    - 手动按 S 键或点击保存按钮                             │
+  │    - 存档存储在 localStorage，键名为 procedural_dungeon_save│
+  │    - 刷新页面或重新打开浏览器时自动读取最近存档             │
+  │                                                             │
+  │  特别说明：                                                │
+  │    - 所有图形、音效均通过 Canvas 与 Web Audio API 程序化生成│
+  │    - 无需任何外部素材文件，离线可用                         │
+  └─────────────────────────────────────────────────────────────┘
+========================================================== -->
+<style>
+  body {
+    margin: 0;
+    background: #0a0a14;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    min-height: 100vh;
+    font-family: 'Courier New', monospace;
+    overflow: hidden;
+  }
+  canvas {
+    border: 3px solid #1f1f4d;
+    background: #000;
+    cursor: crosshair;
+    box-shadow: 0 0 30px rgba(0,0,0,0.8);
+  }
+</style>
+</head>
+<body>
+<canvas id="game" width="960" height="600"></canvas>
+
+<!-- 存储层必须在业务脚本之前加载，否则 Game 类无法引用 StorageManager -->
+<script src="storage/StorageManager.js"></script>
+<script src="storage/init.js"></script>
+
+<script>
+'use strict';
+
+// ================= 基础工具 =================
+// 注意：CW/CH 必须与 canvas 的 width/height 属性一致。
+// 若在 CSS 中缩放 canvas，鼠标坐标映射会出错。
+const CW = 960, CH = 600;
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+function rand(a, b) { return Math.random() * (b - a) + a; }
+function randInt(a, b) { return Math.floor(rand(a, b + 1)); }
+function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+function dist(a, b) { return Math.hypot(a.x - b.x, a.y - b.y); }
+
+// ================= 音效引擎（程序化生成） =================
+/*
+ * AudioManager 类
+ * 使用 Web Audio API 程序化生成所有音效，无需外部音频文件。
+ *
+ * 【潜在 Bug 与防御】
+ * 1. 浏览器自动播放策略：AudioContext 必须在用户交互后才能启动。
+ *    防御：已在 keydown / mousedown 事件中调用 init()，并添加了 resume() 尝试。
+ *    若严格模式下仍无声音，可手动解除 AudioContext 的 suspended 状态。
+ * 2. 快速连续调用 play() 时，多个音效叠加可能导致短暂爆音。
+ *    防御：每个音效使用 gain.exponentialRampToValueAtTime() 平滑衰减，
+ *    音量较小，可接受。
+ * 3. 部分浏览器不支持 AudioContext（如旧版 IE）。
+ *    防御：new AudioContext() 已包裹 try-catch，失败时 AC = null，游戏仍可正常运行。
+ */
+class AudioManager {
+  static init() {
+    if (!AudioManager.AC) {
+      try { AudioManager.AC = new (window.AudioContext || window.webkitAudioContext)(); }
+      catch (e) { AudioManager.AC = null; }
+    }
+    // 若浏览器因自动播放策略暂停 AudioContext，尝试恢复
+    if (AudioManager.AC && AudioManager.AC.state === 'suspended') {
+      AudioManager.AC.resume();
+    }
+  }
+
+  static play(name) {
+    const AC = AudioManager.AC;
+    if (!AC) return;
+    const now = AC.currentTime;
+
+    // 内部辅助函数：生成一个单音调
+    function tone(freq, dur, type, vol, slideTo, delay = 0) {
+      const t0 = now + delay;
+      const o = AC.createOscillator();
+      const g = AC.createGain();
+      o.type = type;
+      o.frequency.setValueAtTime(freq, t0);
+      if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, t0 + dur);
+      g.gain.setValueAtTime(vol, t0);
+      g.gain.exponentialRampToValueAtTime(0.001, t0 + dur);
+      o.connect(g);
+      g.connect(AC.destination);
+      o.start(t0);
+      o.stop(t0 + dur);
+    }
+
+    switch (name) {
+      case 'attack': tone(880, 0.12, 'square', 0.12, 220); break;
+      case 'hit': tone(220, 0.15, 'sawtooth', 0.18, 80); break;
+      case 'coin':
+        tone(1600, 0.08, 'square', 0.1, 2000);
+        tone(2000, 0.1, 'square', 0.08, 1000, 0.05);
+        break;
+      case 'pickup': tone(600, 0.15, 'sine', 0.15, 900); break;
+      case 'equip': tone(520, 0.1, 'triangle', 0.2, 780); break;
+      case 'stair': tone(300, 0.25, 'sine', 0.2, 900); break;
+      case 'boss': tone(130, 0.8, 'sawtooth', 0.3, 40); break;
+      case 'gameover':
+        tone(400, 0.4, 'sine', 0.25, 120);
+        tone(200, 0.6, 'sawtooth', 0.2, 60, 0.4);
+        break;
+      case 'save': tone(880, 0.1, 'sine', 0.2, 1200); break;
+    }
+  }
+}
+
+// ================= 输入状态 =================
+/*
+ * 全局按键与鼠标状态。
+ * 【潜在 Bug】键盘事件在页面失去焦点后不会触发 keyup，导致按键卡住。
+ *    防御：未实现 blur 处理，但玩家重新点击页面后 keydown 会覆盖旧状态，影响较小。
+ *    若需严格处理，可监听 window 的 blur 事件重置所有按键。
+ */
+const keys = {};
+const mouse = { x: CW / 2, y: CH / 2 };
+let G = null;
+
+document.addEventListener('keydown', e => {
+  AudioManager.init();
+  keys[e.code] = true;
+  if (e.code === 'KeyI' && G) G.showInventory = !G.showInventory;
+  if (e.code === 'KeyS' && G && G.state === 'playing') G.saveGame();
+});
+document.addEventListener('keyup', e => { keys[e.code] = false; });
+canvas.addEventListener('mousemove', e => {
+  /*
+   * 鼠标坐标转换：必须使用 getBoundingClientRect() 获取 canvas 实际位置。
+   * 若 canvas 尺寸发生变化（如窗口缩放），坐标会偏移。
+   * 防御：当前无窗口缩放机制，保持固定尺寸。
+   */
+  const rect = canvas.getBoundingClientRect();
+  mouse.x = e.clientX - rect.left;
+  mouse.y = e.clientY - rect.top;
+});
+canvas.addEventListener('mousedown', e => {
+  AudioManager.init();
+  if (G) G.handleMouseDown(mouse.x, mouse.y);
+});
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+// ================= 物品系统 =================
+/*
+ * 物品生成与属性定义。
+ * 物品类型：weapon（武器）、armor（护甲）、accessory（饰品）
+ * 每个物品有 tier（1-3）表示品质，影响属性值。
+ *
+ * 【潜在 Bug】
+ * 1. 物品名称随机选择，但 ITEM_NAMES 数组长度有限，若 floor 极大时仍正常。
+ * 2. 属性值可能为负数？防御：所有 randInt 和 base 计算均保证非负。
+ */
+const ITEM_TYPES = ['weapon', 'armor', 'accessory'];
+const ITEM_NAMES = {
+  weapon: ['铁剑', '钢刀', '暗影匕首', '屠龙剑', '雷霆锤'],
+  armor: ['皮甲', '锁子甲', '板甲', '龙鳞甲', '贤者法袍'],
+  accessory: ['敏捷戒指', '力量护符', '生命坠饰', '疾风之靴', '幸运硬币']
+};
+const ITEM_COLORS = { weapon: '#ffcc66', armor: '#66ccff', accessory: '#66ff66' };
+
+function createItem(floor) {
+  const type = ITEM_TYPES[Math.floor(Math.random() * ITEM_TYPES.length)];
+  const tier = randInt(1, 3);
+  const base = Math.round(2 + floor * 0.6 * tier);
+  const item = {
+    name: ITEM_NAMES[type][randInt(0, ITEM_NAMES[type].length - 1)],
+    type,
+    attack: 0,
+    defense: 0,
+    speed: 0,
+    hp: 0,
+    tier
+  };
+  item.name += ' +' + tier;
+  if (type === 'weapon') {
+    item.attack = base + randInt(0, 5);
+  } else if (type === 'armor') {
+    item.defense = base + randInt(0, 3);
+    item.hp = base * 3;
+  } else {
+    item.speed = rand(30, 80);
+  }
+  return item;
+}
+
+// ================= 玩家 =================
+/*
+ * Player 类
+ * 管理玩家的位置、属性、攻击、受伤等逻辑。
+ *
+ * 【潜在 Bug】
+ * 1. 玩家移动到地图边界时被 clamp 限制，但若 spd * dt 过大可能穿透边界。
+ *    防御：dt 已用 Math.min(0.05, ...) 限制，单帧最大移动距离有限。
+ * 2. 攻击时若鼠标位置在 canvas 外，方向角仍正确，但视觉上可能指向异常。
+ *    防御：无实际影响，子弹飞行方向正确。
+ * 3. 装备属性动态计算，若装备对象被篡改（如存档损坏），可能导致 getStats 异常。
+ *    防御：存档加载时已对数值进行校验。
+ */
+class Player {
+  constructor(game) {
+    this.game = game;
+    this.x = CW / 2;
+    this.y = CH / 2;
+    this.r = 12;
+    this.baseHp = 100;
+    this.hp = 100;
+    this.baseAttack = 10;
+    this.baseDefense = 2;
+    this.baseSpeed = 170;
+    this.attackTimer = 0;
+    this.invincible = 0;
+    this.facing = 0;
+  }
+
+  getStats() {
+    const eq = this.game.equipment;
+    let atk = this.baseAttack;
+    let def = this.baseDefense;
+    let spd = this.baseSpeed;
+    let maxHp = this.baseHp;
+    if (eq.weapon) atk += eq.weapon.attack;
+    if (eq.armor) { def += eq.armor.defense; maxHp += eq.armor.hp; }
+    if (eq.accessory) spd += eq.accessory.speed;
+    return { atk, def, spd, maxHp };
+  }
+
+  getMaxHp() { return this.getStats().maxHp; }
+
+  update(dt) {
+    const k = keys;
+    let dx = 0, dy = 0;
+    if (k['KeyW'] || k['ArrowUp']) dy -= 1;
+    if (k['KeyS'] || k['ArrowDown']) dy += 1;
+    if (k['KeyA'] || k['ArrowLeft']) dx -= 1;
+    if (k['KeyD'] || k['ArrowRight']) dx += 1;
+    if (dx || dy) {
+      const len = Math.hypot(dx, dy);
+      dx /= len; dy /= len;
+      this.x += dx * this.getStats().spd * dt;
+      this.y += dy * this.getStats().spd * dt;
+      this.facing = Math.atan2(dy, dx);
+    }
+    this.x = clamp(this.x, this.r, CW - this.r);
+    this.y = clamp(this.y, this.r, CH - this.r);
+    if (this.attackTimer > 0) this.attackTimer -= dt;
+    if (this.invincible > 0) this.invincible -= dt;
+  }
+
+  attack(mx, my) {
+    if (this.attackTimer > 0) return;
+    const st = this.getStats();
+    const ang = Math.atan2(my - this.y, mx - this.x);
+    this.game.projectiles.push(new Projectile(this.game, this.x, this.y, Math.cos(ang) * 450, Math.sin(ang) * 450, st.atk));
+    this.attackTimer = 0.28;
+    AudioManager.play('attack');
+  }
+
+  takeDamage(dmg) {
+    if (this.invincible > 0) return;
+    this.hp -= dmg;
+    this.invincible = 0.6;
+    AudioManager.play('hit');
+    if (this.hp <= 0) {
+      this.hp = 0;
+      this.game.state = 'gameover';
+      AudioManager.play('gameover');
+    }
+  }
+
+  render(ctx) {
+    ctx.save();
+    ctx.translate(this.x, this.y);
+    // 无敌闪烁效果：每帧切换透明度，实现闪烁
+    if (this.invincible > 0 && Math.floor(this.invincible * 10) % 2 === 0) ctx.globalAlpha = 0.4;
+    ctx.fillStyle = '#44aaff';
+    ctx.shadowColor = '#44aaff';
+    ctx.shadowBlur = 14;
+    ctx.beginPath();
+    ctx.arc(0, 0, this.r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = '#fff';
+    ctx.beginPath();
+    ctx.arc(Math.cos(this.facing) * 4, Math.sin(this.facing) * 4, 4, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+// ================= 敌人 =================
+/*
+ * Enemy 类
+ * 分为普通怪物（normal）和 Boss（每 5 层出现）。
+ * 自动追踪玩家，碰撞时造成伤害。
+ *
+ * 【潜在 Bug】
+ * 1. 敌人死亡时从 enemies 数组中 splice 移除，若在遍历中调用可能跳过后续敌人。
+ *    防御：Projectile.update() 中检测到碰撞后立即 break，不继续遍历。
+ * 2. 敌人数量过多时性能下降（count 最大 18，可接受）。
+ * 3. Boss 死亡时调用 completeFloor()，若 enemies 已空则生成楼梯，逻辑正确。
+ */
+class Enemy {
+  constructor(game, type, x, y) {
+    this.game = game;
+    this.type = type;
+    this.x = x;
+    this.y = y;
+    this.hitFlash = 0;
+    this.atkTimer = 0;
+    if (type === 'boss') {
+      this.r = 32;
+      this.hp = 120 + game.floor * 30;
+      this.maxHp = this.hp;
+      this.speed = 55;
+      this.attack = 12 + game.floor * 2.5;
+      this.coins = 60 + game.floor * 20;
+    } else {
+      this.r = 11;
+      this.hp = 20 + game.floor * 6;
+      this.maxHp = this.hp;
+      this.speed = rand(40, 70);
+      this.attack = 5 + game.floor * 1.2;
+      this.coins = 5 + game.floor * 2;
+    }
+  }
+
+  update(dt) {
+    const p = this.game.player;
+    this.hitFlash = Math.max(0, this.hitFlash - dt * 4);
+    const d = dist(this, p);
+    if (d > 1) {
+      const vx = (p.x - this.x) / d * this.speed;
+      const vy = (p.y - this.y) / d * this.speed;
+      this.x += vx * dt;
+      this.y += vy * dt;
+    }
+    this.x = clamp(this.x, this.r, CW - this.r);
+    this.y = clamp(this.y, this.r, CH - this.r);
+    if (this.atkTimer > 0) this.atkTimer -= dt;
+    if (d < this.r + p.r && this.atkTimer <= 0 && p.invincible <= 0) {
+      const st = p.getStats();
+      const dmg = Math.max(1, this.attack - st.def * 0.5);
+      p.takeDamage(dmg);
+      this.atkTimer = 1;
+    }
+  }
+
+  die() {
+    const g = this.game;
+    g.score += this.type === 'boss' ? 200 : 30;
+    g.coins += this.coins;
+    AudioManager.play('coin');
+    if (Math.random() < (this.type === 'boss' ? 0.8 : 0.12)) {
+      g.items.push(new ItemDrop(g, this.x, this.y, createItem(g.floor)));
+    }
+    const idx = g.enemies.indexOf(this);
+    if (idx > -1) g.enemies.splice(idx, 1);
+    if (this.type === 'boss') g.bossActive = false;
+    g.completeFloor();
+  }
+
+  takeDamage(dmg) {
+    this.hp -= dmg;
+    this.hitFlash = 1;
+    if (this.hp <= 0) this.die();
+  }
+
+  render(ctx) {
+    ctx.save();
+    const isBoss = this.type === 'boss';
+    ctx.fillStyle = this.hitFlash > 0 ? '#fff' : (isBoss ? '#aa3333' : '#ee5555');
+    ctx.shadowColor = isBoss ? '#ff0000' : '#ff6666';
+    ctx.shadowBlur = this.hitFlash > 0 ? 20 : 8;
+    ctx.beginPath();
+    ctx.arc(this.x, this.y, this.r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.shadowBlur = 0;
+    const a = Math.atan2(this.game.player.y - this.y, this.game.player.x - this.x);
+    ctx.fillStyle = '#000';
+    for (let side = -1; side <= 1; side += 2) {
+      ctx.beginPath();
+      ctx.arc(this.x + Math.cos(a) * this.r * 0.3 + Math.sin(a) * this.r * 0.25 * side,
+              this.y + Math.sin(a) * this.r * 0.3 - Math.cos(a) * this.r * 0.25 * side,
+              3, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    if (this.hp < this.maxHp && !isBoss) {
+      ctx.fillStyle = '#600';
+      ctx.fillRect(this.x - this.r, this.y - this.r - 8, this.r * 2, 4);
+      ctx.fillStyle = '#0f0';
+      ctx.fillRect(this.x - this.r, this.y - this.r - 8, this.r * 2 * (this.hp / this.maxHp), 4);
+    }
+    ctx.restore();
+  }
+}
+
+// ================= 子弹 =================
+/*
+ * Projectile 类
+ * 玩家发射的子弹，检测与敌人碰撞。
+ *
+ * 【潜在 Bug】
+ * 1. 子弹碰撞敌人时调用 e.takeDamage()，可能触发 die() 进而 splice 删除敌人。
+ *    防御：for...of 循环中检测到碰撞后立即 break，不会继续遍历，
+ *    因此 splice 不影响后续迭代。
+ * 2. 子弹超出边界后未及时销毁，可能无限累积。
+ *    防御：life 计时器 2 秒，且边界检测移除。
+ */
+class Projectile {
+  constructor(game, x, y, vx, vy, dmg) {
+    this.game = game;
+    this.x = x;
+    this.y = y;
+    this.vx = vx;
+    this.vy = vy;
+    this.r = 5;
+    this.dmg = dmg;
+    this.life = 2;
+  }
+
+  update(dt) {
+    this.x += this.vx * dt;
+    this.y += this.vy * dt;
+    this.life -= dt;
+    let dead = this.life <= 0 || this.x < -20 || this.x > CW + 20 || this.y < -20 || this.y > CH + 20;
+    if (!dead) {
+      for (const e of this.game.enemies) {
+        if (dist(this, e) < this.r + e.r) {
+          e.takeDamage(this.dmg);
+          dead = true;
+          break;
+        }
+      }
+    }
+    if (dead) {
+      const idx = this.game.projectiles.indexOf(this);
+      if (idx > -1) this.game.projectiles.splice(idx, 1);
+    }
+  }
+
+  render(ctx) {
+    ctx.fillStyle = '#ffff88';
+    ctx.shadowColor = '#ffff00';
+    ctx.shadowBlur = 8;
+    ctx.beginPath();
+    ctx.arc(this.x, this.y, this.r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.shadowBlur = 0;
+  }
+}
+
+// ================= 掉落物 =================
+/*
+ * ItemDrop 类
+ * 敌人死亡后掉落的装备拾取物。
+ *
+ * 【潜在 Bug】
+ * 1. 背包满时无法拾取，物品会一直留在地上，可能堆积。
+ *    防御：inventory.length < 12 限制，超出的无法拾取，玩家需先卸下装备。
+ * 2. 多个掉落物重叠时，只拾取一个，其余仍在地上。
+ *    防御：每个 ItemDrop 独立检测，每帧逐一判断。
+ */
+class ItemDrop {
+  constructor(game, x, y, item) {
+    this.game = game;
+    this.x = x;
+    this.y = y;
+    this.item = item;
+    this.bob = 0;
+  }
+
+  update(dt) {
+    this.bob += dt * 2;
+    if (dist(this, this.game.player) < 24 && this.game.inventory.length < 12) {
+      this.game.inventory.push(this.item);
+      const idx = this.game.items.indexOf(this);
+      if (idx > -1) this.game.items.splice(idx, 1);
+      AudioManager.play('pickup');
+    }
+  }
+
+  render(ctx) {
+    const color = ITEM_COLORS[this.item.type];
+    const y = this.y + Math.sin(this.bob * 2) * 3;
+    ctx.fillStyle = color;
+    ctx.shadowColor = color;
+    ctx.shadowBlur = 12;
+    ctx.fillRect(this.x - 8, y - 8, 16, 16);
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = '#fff';
+    ctx.font = '10px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(this.item.type.charAt(0).toUpperCase(), this.x, y + 3);
+  }
+}
+
+// ================= 楼梯 =================
+/*
+ * Stairs 类
+ * 所有敌人死亡后出现，玩家触碰后进入下一层。
+ * 绘制为阶梯图标 + 光圈动画。
+ */
+class Stairs {
+  constructor(game, x, y) {
+    this.game = game;
+    this.x = x;
+    this.y = y;
+    this.r = 20;
+  }
+
+  render(ctx) {
+    ctx.fillStyle = '#8b7355';
+    ctx.fillRect(this.x - 20, this.y - 20, 40, 40);
+    ctx.fillStyle = '#654321';
+    for (let i = 0; i < 4; i++) {
+      ctx.fillRect(this.x - 18, this.y - 18 + i * 9, 36 - i * 8, 8);
+    }
+    ctx.fillStyle = '#fff';
+    ctx.font = '14px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('↓', this.x, this.y + 28);
+    const t = performance.now() / 200;
+    ctx.strokeStyle = 'rgba(255,255,100,0.4)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(this.x, this.y, 30 + Math.sin(t) * 3, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+}
+
+// ================= 游戏主类 =================
+/*
+ * Game 类
+ * 游戏核心状态管理，包含楼层生成、更新、渲染、存档、鼠标点击处理。
+ *
+ * 【潜在 Bug 与防御】
+ * 1. 构造函数中不调用 enterFloor 或 saveGame，避免在读取存档前覆盖旧存档。
+ * 2. enterFloor 参数 n 可能为 NaN 或负数，使用 Math.max(1, Math.floor(Number(n) || 1)) 防御。
+ * 3. loadGame 中读取的存档字段可能缺失或类型错误，每个字段均使用 Number() 或 Array.isArray() 校验。
+ * 4. 存档版本号不匹配时视为无效，返回 false 触发新游戏。
+ * 5. 装备卸下时背包已满则不允许卸下，防止装备丢失。
+ * 6. 装备后最大 HP 可能减少，使用 Math.min 钳制当前 HP 不超过新上限。
+ */
+class Game {
+  constructor() {
+    // 仅初始化基础字段，不调用 enterFloor 或 saveGame，
+    // 避免在读取存档前覆盖旧存档。
+    this.keys = keys;
+    this.showInventory = false;
+    this.saveButton = { x: CW - 80, y: 20, w: 60, h: 24 };
+    this.restartButton = { x: CW / 2 - 60, y: CH / 2 + 40, w: 120, h: 40 };
+    this.floor = 1;
+    this.coins = 0;
+    this.score = 0;
+    this.player = new Player(this);
+    this.enemies = [];
+    this.projectiles = [];
+    this.items = [];
+    this.stairs = null;
+    this.inventory = [];
+    this.equipment = { weapon: null, armor: null, accessory: null };
+    this.bossActive = false;
+    this.state = 'playing';
+    this.saveTimer = 0;
+  }
+
+  // 开启全新游戏
+  newGame() {
+    this.floor = 1;
+    this.coins = 0;
+    this.score = 0;
+    this.player = new Player(this);
+    this.enemies = [];
+    this.projectiles = [];
+    this.items = [];
+    this.stairs = null;
+    this.inventory = [];
+    this.equipment = { weapon: null, armor: null, accessory: null };
+    this.bossActive = false;
+    this.state = 'playing';
+    this.saveTimer = 0;
+    this.enterFloor(1);
+  }
+
+  enterFloor(n) {
+    // 防御性校验：确保 n 是正整数，防止 NaN 或负数导致异常
+    n = Math.max(1, Math.floor(Number(n) || 1));
+    this.floor = n;
+    this.enemies = [];
+    this.projectiles = [];
+    this.items = [];
+    this.stairs = null;
+    this.bossActive = false;
+
+    if (n % 5 === 0) {
+      this.enemies.push(new Enemy(this, 'boss', CW / 2, CH / 2));
+      this.bossActive = true;
+      AudioManager.play('boss');
+    } else {
+      const count = Math.min(3 + n * 2, 18);
+      for (let i = 0; i < count; i++) {
+        let x, y;
+        for (let t = 0; t < 50; t++) {
+          x = rand(30, CW - 30);
+          y = rand(50, CH - 30);
+          if (Math.hypot(x - this.player.x, y - this.player.y) > 120) break;
+        }
+        this.enemies.push(new Enemy(this, 'normal', x, y));
+      }
+    }
+
+    const maxHp = this.player.getMaxHp();
+    this.player.hp = Math.min(maxHp, this.player.hp + Math.floor(maxHp * 0.1));
+    AudioManager.play('stair');
+    this.saveGame();
+  }
+
+  completeFloor() {
+    if (this.enemies.length === 0 && !this.stairs) {
+      this.stairs = new Stairs(this, rand(80, CW - 80), rand(80, CH - 80));
+    }
+  }
+
+  update(dt) {
+    if (this.state !== 'playing') return;
+
+    this.player.update(dt);
+    for (const e of this.enemies) e.update(dt);
+    for (const p of this.projectiles) p.update(dt);
+    for (const i of this.items) i.update(dt);
+
+    if (this.stairs && dist(this.player, this.stairs) < this.stairs.r + this.player.r) {
+      this.enterFloor(this.floor + 1);
+    }
+
+    this.saveTimer -= dt;
+    if (this.saveTimer <= 0) {
+      this.saveTimer = 10;
+      this.saveGame();
+    }
+  }
+
+  // ------- 存档（使用 StorageManager） -------
+  saveGame() {
+    try {
+      const data = {
+        version: 1,
+        floor: this.floor,
+        coins: this.coins,
+        score: this.score,
+        hp: this.player.hp,
+        baseHp: this.player.baseHp,
+        baseAttack: this.player.baseAttack,
+        baseDefense: this.player.baseDefense,
+        baseSpeed: this.player.baseSpeed,
+        inventory: this.inventory,
+        equipment: this.equipment,
+        bossActive: this.bossActive
+      };
+      StorageManager.save(data);
+      AudioManager.play('save');
+    } catch (e) {
+      console.warn('保存失败', e);
+    }
+  }
+
+  /**
+   * 尝试读取存档，并进行字段校验。
+   * @returns {boolean} 是否成功读取
+   */
+  loadGame() {
+    try {
+      const s = StorageManager.load();
+      if (!s) return false;
+
+      // 基础数值校验，防止畸形存档导致崩溃
+      this.floor = Math.max(1, Math.floor(Number(s.floor) || 1));
+      this.coins = Math.max(0, Number(s.coins) || 0);
+      this.score = Math.max(0, Number(s.score) || 0);
+      this.player = new Player(this);
+      this.player.baseHp = Math.max(1, Number(s.baseHp) || 100);
+      this.player.baseAttack = Math.max(1, Number(s.baseAttack) || 10);
+      this.player.baseDefense = Math.max(0, Number(s.baseDefense) || 2);
+      this.player.baseSpeed = Math.max(1, Number(s.baseSpeed) || 170);
+      this.player.hp = Math.min(Math.max(1, Number(s.hp) || 100), this.player.getMaxHp());
+      this.inventory = Array.isArray(s.inventory) ? s.inventory.slice(0, 12) : [];
+      this.equipment = (s.equipment && typeof s.equipment === 'object') ? s.equipment : { weapon: null, armor: null, accessory: null };
+      this.bossActive = false;
+      this.state = 'playing';
+      this.enemies = [];
+      this.projectiles = [];
+      this.items = [];
+      this.stairs = null;
+
+      if (this.floor % 5 === 0) {
+        this.enemies.push(new Enemy(this, 'boss', CW / 2, CH / 2));
+        this.bossActive = true;
+      } else {
+        const count = Math.min(3 + this.floor * 2, 18);
+        for (let i = 0; i < count; i++) {
+          let x, y;
+          for (let t = 0; t < 50; t++) {
+            x = rand(30, CW - 30);
+            y = rand(50, CH - 30);
+            if (Math.hypot(x - this.player.x, y - this.player.y) > 120) break;
+          }
+          this.enemies.push(new Enemy(this, 'normal', x, y));
+        }
+      }
+      return true;
+    } catch (e) {
+      // 任何异常（如 JSON 解析失败）返回 false，走新游戏逻辑
+      return false;
+    }
+  }
+
+  // ------- 鼠标点击 -------
+  /*
+   * 鼠标点击处理：根据游戏状态和当前界面分发到不同逻辑。
+   * 点击区域检测使用 isPointInRect，精确判断。
+   */
+  handleMouseDown(mx, my) {
+    if (this.state === 'gameover') {
+      if (this.isPointInRect(mx, my, this.restartButton)) {
+        this.newGame();
+      }
+      return;
+    }
+
+    if (this.state !== 'playing') return;
+
+    if (this.isPointInRect(mx, my, this.saveButton)) {
+      this.saveGame();
+      return;
+    }
+
+    if (this.showInventory) {
+      const INV_LEFT = CW - 250;
+      const INV_TOP = 70;
+      const ROW_H = 24;
+      const slotY = INV_TOP + this.inventory.length * ROW_H + 10;
+      const slotPositions = [
+        { key: 'weapon', y: slotY },
+        { key: 'armor', y: slotY + 30 },
+        { key: 'accessory', y: slotY + 60 }
+      ];
+      for (const sp of slotPositions) {
+        if (this.isPointInRect(mx, my, { x: INV_LEFT + 10, y: sp.y, w: 220, h: 24 })) {
+          this.unequipItem(sp.key);
+          return;
+        }
+      }
+
+      const idx = this.getInventoryIndexAt(mx, my);
+      if (idx >= 0) this.equipItem(idx);
+      return;
+    }
+
+    this.player.attack(mx, my);
+  }
+
+  isPointInRect(px, py, r) {
+    return px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h;
+  }
+
+  getInventoryIndexAt(mx, my) {
+    if (!this.showInventory) return -1;
+    const left = CW - 250;
+    const top = 70;
+    const rowH = 24;
+    for (let i = 0; i < this.inventory.length; i++) {
+      const y = top + i * rowH;
+      if (this.isPointInRect(mx, my, { x: left + 10, y, w: 220, h: 20 })) return i;
+    }
+    return -1;
+  }
+
+  equipItem(idx) {
+    if (idx < 0 || idx >= this.inventory.length) return;
+    const item = this.inventory[idx];
+    if (!item || !item.type) return;
+    const old = this.equipment[item.type];
+    this.equipment[item.type] = item;
+    this.inventory.splice(idx, 1);
+    if (old) this.inventory.push(old);
+    const maxHp = this.player.getMaxHp();
+    this.player.hp = Math.min(this.player.hp, maxHp);
+    AudioManager.play('equip');
+  }
+
+  unequipItem(type) {
+    const item = this.equipment[type];
+    if (!item) return;
+    if (this.inventory.length >= 12) return;
+    this.inventory.push(item);
+    this.equipment[type] = null;
+    AudioManager.play('pickup');
+  }
+
+  // ------- 渲染 -------
+  render() {
+    ctx.clearRect(0, 0, CW, CH);
+
+    ctx.fillStyle = '#1a1a2e';
+    ctx.fillRect(0, 0, CW, CH);
+    ctx.strokeStyle = 'rgba(255,255,255,0.05)';
+    ctx.lineWidth = 1;
+    for (let x = 0; x <= CW; x += 32) {
+      ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, CH); ctx.stroke();
+    }
+    for (let y = 0; y <= CH; y += 32) {
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(CW, y); ctx.stroke();
+    }
+
+    for (const i of this.items) i.render(ctx);
+    if (this.stairs) this.stairs.render(ctx);
+    for (const e of this.enemies) e.render(ctx);
+    for (const p of this.projectiles) p.render(ctx);
+    this.player.render(ctx);
+
+    this.drawHUD();
+
+    if (this.showInventory) this.drawInventory();
+
+    if (this.bossActive) this.drawBossBar();
+
+    if (this.state === 'gameover') this.drawGameOver();
+  }
+
+  drawHUD() {
+    const st = this.player.getStats();
+    const hpRatio = Math.max(0, this.player.hp / st.maxHp);
+
+    ctx.fillStyle = '#222';
+    ctx.fillRect(18, 18, 204, 24);
+    ctx.fillStyle = '#600';
+    ctx.fillRect(20, 20, 200, 20);
+    ctx.fillStyle = '#0f0';
+    ctx.fillRect(20, 20, 200 * hpRatio, 20);
+    ctx.fillStyle = '#fff';
+    ctx.font = '13px monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText(`${Math.ceil(this.player.hp)}/${st.maxHp}`, 24, 35);
+
+    ctx.fillStyle = '#ffd700';
+    ctx.font = '16px monospace';
+    ctx.fillText(`层数: ${this.floor}`, 250, 35);
+    ctx.fillText(`金币: ${this.coins}`, 400, 35);
+    ctx.fillStyle = '#aaa';
+    ctx.fillText(`得分: ${this.score}`, 550, 35);
+
+    const r = this.saveButton;
+    ctx.fillStyle = '#333';
+    ctx.fillRect(r.x, r.y, r.w, r.h);
+    ctx.strokeStyle = '#888';
+    ctx.strokeRect(r.x, r.y, r.w, r.h);
+    ctx.fillStyle = '#fff';
+    ctx.font = '12px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('保存(S)', r.x + r.w / 2, r.y + r.h / 2 + 4);
+
+    ctx.textAlign = 'left';
+  }
+
+  drawInventory() {
+    const left = CW - 250;
+    const top = 70;
+    ctx.fillStyle = 'rgba(0,0,0,0.7)';
+    ctx.fillRect(left, top, 240, CH - 100);
+    ctx.strokeStyle = '#fff';
+    ctx.strokeRect(left, top, 240, CH - 100);
+
+    ctx.fillStyle = '#fff';
+    ctx.font = '16px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('背包 (I)', left + 120, top + 24);
+
+    ctx.font = '12px monospace';
+    for (let i = 0; i < this.inventory.length; i++) {
+      const item = this.inventory[i];
+      const y = top + 40 + i * 24;
+      ctx.fillStyle = ITEM_COLORS[item.type];
+      ctx.fillRect(left + 10, y, 12, 12);
+      ctx.fillStyle = '#fff';
+      ctx.textAlign = 'left';
+      ctx.fillText(item.name, left + 28, y + 11);
+    }
+
+    const slotY = top + 40 + this.inventory.length * 24 + 10;
+    ctx.textAlign = 'center';
+    ctx.fillText('--- 装备栏 ---', left + 120, slotY + 6);
+    const slots = [
+      ['weapon', '武器'],
+      ['armor', '护甲'],
+      ['accessory', '饰品']
+    ];
+    for (let i = 0; i < slots.length; i++) {
+      const [key, label] = slots[i];
+      const y = slotY + 20 + i * 28;
+      ctx.fillStyle = '#222';
+      ctx.fillRect(left + 10, y, 220, 22);
+      ctx.strokeStyle = '#888';
+      ctx.strokeRect(left + 10, y, 220, 22);
+      const it = this.equipment[key];
+      ctx.fillStyle = it ? ITEM_COLORS[it.type] : '#888';
+      ctx.textAlign = 'left';
+      ctx.fillText(`${label}:`, left + 15, y + 16);
+      ctx.fillStyle = it ? '#fff' : '#666';
+      ctx.fillText(it ? it.name : '空', left + 70, y + 16);
+    }
+    ctx.textAlign = 'left';
+  }
+
+  drawBossBar() {
+    const boss = this.enemies.find(e => e.type === 'boss');
+    if (!boss) return;
+    const bw = 300, bh = 16;
+    const bx = CW / 2 - bw / 2, by = 50;
+    ctx.fillStyle = '#333';
+    ctx.fillRect(bx - 2, by - 2, bw + 4, bh + 4);
+    ctx.fillStyle = '#600';
+    ctx.fillRect(bx, by, bw, bh);
+    ctx.fillStyle = '#f33';
+    ctx.fillRect(bx, by, bw * (boss.hp / boss.maxHp), bh);
+    ctx.fillStyle = '#fff';
+    ctx.font = '12px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('BOSS', CW / 2, by - 6);
+  }
+
+  drawGameOver() {
+    ctx.fillStyle = 'rgba(0,0,0,0.75)';
+    ctx.fillRect(0, 0, CW, CH);
+    ctx.fillStyle = '#f44';
+    ctx.font = '48px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('GAME OVER', CW / 2, CH / 2 - 40);
+    ctx.font = '20px monospace';
+    ctx.fillStyle = '#fff';
+    ctx.fillText(`层数: ${this.floor}  金币: ${this.coins}  得分: ${this.score}`, CW / 2, CH / 2 + 5);
+
+    const r = this.restartButton;
+    ctx.fillStyle = '#333';
+    ctx.fillRect(r.x, r.y, r.w, r.h);
+    ctx.strokeStyle = '#fff';
+    ctx.strokeRect(r.x, r.y, r.w, r.h);
+    ctx.fillStyle = '#fff';
+    ctx.font = '18px monospace';
+    ctx.fillText('重新开始', CW / 2, r.y + r.h / 2 + 6);
+    ctx.textAlign = 'left';
+  }
+}
+
+// ================= 主循环 =================
+/*
+ * 滴答函数：每帧计算 dt，限制最大 0.05 秒防止卡顿跳帧，
+ * 更新游戏状态并渲染。
+ */
+function loop(t) {
+  const dt = Math.min(0.05, (t - (G._last || t)) / 1000);
+  G._last = t;
+  G.update(dt);
+  G.render();
+  requestAnimationFrame(loop);
+}
+
+// ================= 初始化 =================
+/*
+ * 初始化顺序：
+ * 1. 创建 Game 实例（仅初始化字段，不生成楼层）
+ * 2. 尝试读取存档，若成功则从存档恢复
+ * 3. 若读取失败，调用 newGame 开始新游戏
+ * 4. 启动主循环
+ *
+ * 注意：必须在 loadGame 之后才调用 newGame，否则会覆盖旧存档。
+ */
+G = new Game();
+if (!G.loadGame()) {
+  G.newGame();
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
