@@ -1,0 +1,19 @@
+{
+  "name": "dungeon-explorer-server",
+  "version": "1.0.0",
+  "description": "地牢探险者 后端数据存储层",
+  "main": "server.js",
+  "scripts": {
+    "init": "node scripts/init.js",
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.3.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
